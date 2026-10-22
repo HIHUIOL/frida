@@ -404,8 +404,9 @@ jobs:
           INIT_OFF=$(readelf -S -W "$KO" | awk '$2==".init.text"{print $5}')
           EXIT_OFF=$(readelf -S -W "$KO" | awk '$2==".exit.text"{print $5}')
           echo "init offset=$INIT_OFF exit offset=$EXIT_OFF"
-          printf '\x35\x30\xbb\x6f' | dd of="$KO" bs=1 seek=$((INIT_OFF)) conv=notrunc
-          printf '\x60\x7d\xc4\xe5' | dd of="$KO" bs=1 seek=$((EXIT_OFF)) conv=notrunc
+          # readelf prints bare hex; bash needs the 0x prefix for arithmetic
+          printf '\x35\x30\xbb\x6f' | dd of="$KO" bs=1 seek=$((0x$INIT_OFF)) conv=notrunc
+          printf '\x60\x7d\xc4\xe5' | dd of="$KO" bs=1 seek=$((0x$EXIT_OFF)) conv=notrunc
           echo "=== KCFI after patch ==="
           llvm-objcopy -O binary --only-section=.init.text "$KO" /tmp/i2.bin 2>/dev/null
           od -A n -t x1 -N 4 /tmp/i2.bin
