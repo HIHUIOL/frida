@@ -102,7 +102,7 @@ jobs:
             --enable-server \
             --enable-portal \
             -- \
-            -Dbarebone_backend=enabled \
+            -Dfrida-core:barebone_backend=enabled \
             -Dfrida-gum:devkits=gum,gumjs \
             -Dfrida-core:devkits=core \
             -Dfrida-core:compiler_backend=disabled
@@ -194,7 +194,7 @@ jobs:
             --enable-server \
             --enable-portal \
             -- \
-            -Dbarebone_backend=enabled \
+            -Dfrida-core:barebone_backend=enabled \
             -Dfrida-gum:devkits=gum,gumjs \
             -Dfrida-core:devkits=core \
             -Dfrida-core:compiler_backend=disabled
