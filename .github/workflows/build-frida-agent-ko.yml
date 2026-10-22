@@ -293,6 +293,21 @@ jobs:
           make ARCH=arm64 LLVM=1 O=out gki_defconfig
           make ARCH=arm64 LLVM=1 O=out -j$(nproc) modules_prepare
 
+      - name: Inject Module.symvers (device CRCs)
+        run: |
+          # modules_prepare does not emit Module.symvers; without it modpost
+          # reports every core export (memset, kfree, _printk, ...) as undefined.
+          # These 4432 entries were recovered from the __versions of the 375
+          # vendor .ko shipped with the device, so the CRCs are the real ones.
+          curl -fsSL \
+            "https://raw.githubusercontent.com/${{ github.repository }}/main/.ci/Module.symvers" \
+            -o "$RUNNER_WORKSPACE/ksrc/out/Module.symvers"
+          wc -l "$RUNNER_WORKSPACE/ksrc/out/Module.symvers"
+          head -2 "$RUNNER_WORKSPACE/ksrc/out/Module.symvers"
+          echo "--- sanity: must contain module_layout and memset ---"
+          grep -c 'module_layout' "$RUNNER_WORKSPACE/ksrc/out/Module.symvers"
+          grep -c '	memset	' "$RUNNER_WORKSPACE/ksrc/out/Module.symvers"
+
       - name: Pre-link agent objects
         working-directory: ${{ github.workspace }}/subprojects/frida-core/src/barebone/agent/linux
         env:
