@@ -268,7 +268,13 @@ jobs:
         run: |
           F="$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent/linux/frida-kmod.c"
           cp "$F" "$F.orig"
-          python3 "$GITHUB_WORKSPACE/.ci/patch_frida_kmod.py" "$F"
+          # fetch the patch script from our own fork (the frida checkout above
+          # pulls upstream, so .ci/ is not present here)
+          curl -fsSL \
+            "https://raw.githubusercontent.com/${{ github.repository }}/main/.ci/patch_frida_kmod.py" \
+            -o /tmp/patch_frida_kmod.py
+          head -3 /tmp/patch_frida_kmod.py
+          python3 /tmp/patch_frida_kmod.py "$F"
           echo "=== diff ==="
           diff -u "$F.orig" "$F" || true
 
