@@ -14,7 +14,7 @@ on:
       frida_ref:
         description: "frida ref (commit/tag/branch). MUST match the .ko build."
         required: true
-        default: "e0819e7917783abe500b63465f88201d0157a248"
+        default: "6cb6b64bbd823bf9c387e740e8f3076a4589d396"
       dry_run:
         description: "仅跑 configure（验证 barebone: YES），不编译"
         required: false
