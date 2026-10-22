@@ -1,0 +1,85 @@
+name: KCFI probe (r536225 vs clang 21)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout frida (for nothing but a workspace)
+        uses: actions/checkout@v4
+        with:
+          repository: frida/frida
+          ref: main
+          submodules: false
+
+      - name: Fetch AOSP prebuilt clang r536225
+        run: |
+          cd "$RUNNER_WORKSPACE"
+          git clone --filter=blob:none --no-checkout ${{ secrets.CLANG_GIT_URL || 'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86' }} pclang
+          cd pclang
+          git fetch --depth 1 origin 7143812acf96c9af445b164656ae7f424a67a573
+          git checkout FETCH_HEAD -- clang-r536225
+          du -sh clang-r536225
+          chmod +x clang-r536225/bin/*
+          ./clang-r536225/bin/clang-19 --version
+
+      - name: Install upstream clang 21
+        run: |
+          curl -sSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 21
+          /usr/lib/llvm-21/bin/clang --version
+
+      - name: Write probe source
+        run: |
+          cd "$RUNNER_WORKSPACE"
+          printf 'int testfn(void) { return 0; }\n' > kt.c
+          printf 'int (*volatile p1)(void) = testfn;\n\n' >> kt.c
+          printf 'int klsfn(const char *name);\n' >> kt.c
+          printf 'const char *(*volatile p2)(const char *) = klsfn;\n' >> kt.c
+          cat kt.c
+
+      - name: Compile with AOSP r536225
+        run: |
+          C="$RUNNER_WORKSPACE/pclang/clang-r536225/bin/clang-19"
+          cd "$RUNNER_WORKSPACE"
+          $C -target aarch64-linux-gnu -O2 -c kt.c -fsanitize=kcfi -o kt_r536225.o
+          echo "=== r536225 objdump ==="
+          $C --version | head -1
+          llvm-objdump -d --section=.text kt_r536225.o 2>/dev/null | head -30 || objdump -d -j .text kt_r536225.o
+
+      - name: Compile with upstream clang 21
+        run: |
+          C=/usr/lib/llvm-21/bin/clang
+          cd "$RUNNER_WORKSPACE"
+          $C -target aarch64-linux-gnu -O2 -c kt.c -fsanitize=kcfi -o kt_21.o
+          echo "=== clang21 objdump ==="
+          $C --version | head -1
+          llvm-objdump -d --section=.text kt_21.o 2>/dev/null | head -30 || objdump -d -j .text kt_21.o
+
+      - name: Compare KCFI type ids
+        run: |
+          cd "$RUNNER_WORKSPACE"
+          echo "===== SUMMARY ====="
+          echo "device expects:  testfn(void)  -> 0x6fbb3035"
+          echo
+          for f in kt_r536225.o kt_21.o; do
+            echo "--- $f ---"
+            objcopy -O binary --only-section=.text "$f" /tmp/t.bin 2>/dev/null
+            od -A n -t x4 -N 4 /tmp/t.bin
+          done
+
+      - name: Show kcfi_type metadata (LLVM IR)
+        run: |
+          for C in "$RUNNER_WORKSPACE/pclang/clang-r536225/bin/clang-19" /usr/lib/llvm-21/bin/clang; do
+            echo "=== $($C --version | head -1) ==="
+            $C -target aarch64-linux-gnu -O2 -S -emit-llvm \
+               "$RUNNER_WORKSPACE/kt.c" -fsanitize=kcfi -o - 2>/dev/null \
+               | grep -E 'kcfi_type|define|@testfn|@klsfn' | head -12
+            echo
+          done
