@@ -1,0 +1,249 @@
+name: Build frida-server (Android arm64, barebone)
+
+# 目标：产出一个编译时启用了 Barebone backend 的 frida-server，
+# 使得它可以用 `--device barebone` 通过 /dev/frida 与内核 agent 通信。
+#
+# 关键点：
+#   1. 必须显式 --enable-barebone-backend（meson 选项默认是 auto，会静默降级）
+#   2. barebone 依赖 quickjs + lzfse，两者都有 meson wrap，自动拉取
+#   3. 必须与 frida-agent.ko 用同一个 frida commit
+
+on:
+  workflow_dispatch:
+    inputs:
+      frida_ref:
+        description: "frida ref (commit/tag/branch). MUST match the .ko build."
+        required: true
+        default: "e0819e7917783abe500b63465f88201d0157a248"
+      dry_run:
+        description: "仅跑 configure（验证 barebone: YES），不编译"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  FRIDA_REF: ${{ inputs.frida_ref }}
+  ANDROID_NDK_VERSION: r29
+  FRIDA_PREFIX: ${{ github.workspace }}/_prefix
+
+jobs:
+  # ────────────────────────────────────────────────
+  # Job 1: 配置诊断（快速失败，不编译）
+  # ─────────────────────────────────────────────────
+  configure-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout frida
+        uses: actions/checkout@v4
+        with:
+          repository: frida/frida
+          ref: ${{ env.FRIDA_REF }}
+          submodules: false
+
+      - name: Fetch releng + frida-core + frida-gum
+        run: |
+          git submodule update --init --depth 1 releng
+          cd releng && git submodule update --init --depth 1
+          cd "$GITHUB_WORKSPACE"
+          python3 tools/ensure-submodules.py frida-core
+          python3 tools/ensure-submodules.py frida-gum
+
+      - name: Show resolved commit
+        run: |
+          echo "=== frida (superproject) ==="
+          git -C "$GITHUB_WORKSPACE" rev-parse HEAD
+          echo "=== frida-core ==="
+          git -C "$GITHUB_WORKSPACE/subprojects/frida-core" rev-parse HEAD 2>/dev/null || true
+
+      - name: Verify wrap files exist
+        run: |
+          echo "=== quickjs.wrap (expected in frida-gum) ==="
+          ls -la "$GITHUB_WORKSPACE/subprojects/frida-gum/subprojects/quickjs.wrap" || {
+            echo "MISSING quickjs.wrap"; exit 1; }
+          cat "$GITHUB_WORKSPACE/subprojects/frida-gum/subprojects/quickjs.wrap"
+
+          echo "=== lzfse.wrap (expected in frida-core) ==="
+          ls -la "$GITHUB_WORKSPACE/subprojects/frida-core/subprojects/lzfse.wrap" || {
+            echo "MISSING lzfse.wrap"; exit 1; }
+          cat "$GITHUB_WORKSPACE/subprojects/frida-core/subprojects/lzfse.wrap"
+
+      - name: Set up NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.ANDROID_NDK_VERSION }}
+          add-to-path: false
+
+      - name: Export NDK root
+        run: |
+          echo "ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+          echo "NDK = ${{ steps.setup-ndk.outputs.ndk-path }}"
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build python3-pip pkg-config \
+            valac libglib2.0-dev libgee-0.8-dev \
+            libjson-glib-dev libsoup-3.0-dev \
+            libssl-dev bison flex \
+            texinfo libtool autoconf automake
+          pip3 install --break-system-packages meson
+
+      - name: Configure (barebone enabled)
+        run: |
+          set -x
+          ./configure \
+            "--prefix=$FRIDA_PREFIX" \
+            --host=android-arm64 \
+            --enable-server \
+            --enable-barebone-backend \
+            --enable-portal \
+            -- \
+            -Dfrida-gum:devkits=gum,gumjs \
+            -Dfrida-core:devkits=core \
+            -Dfrida-core:compiler_backend=disabled
+
+      - name: Verify meson summary reports barebone enabled
+        run: |
+          echo "=== build dir ==="
+          ls -la build 2>/dev/null || true
+
+          echo "=== backend options from meson introspection ==="
+          if [ -f build/meson-info/intro-buildoptions.json ]; then
+            python3 -c "
+          import json, pathlib
+          data = json.loads(pathlib.Path('build/meson-info/intro-buildoptions.json').read_text())
+          for o in data:
+              n = o.get('name', '')
+              if 'backend' in n or n in ('server', 'portal', 'connectivity'):
+                  print('%-28s value=%r' % (n, o.get('value')))
+          "
+          else
+            echo "intro-buildoptions.json not found"
+          fi
+
+          echo "=== meson-log backends section ==="
+          grep -B2 -A20 -iE 'Backends' build/meson-logs/meson-log.txt 2>/dev/null | head -40 || true
+
+      - name: Assert barebone enabled
+        run: |
+          LOG="$GITHUB_WORKSPACE/build/meson-logs/meson-log.txt"
+          if [ -f "$LOG" ]; then
+            echo "=== meson-log tail (backends) ==="
+            grep -A20 -iE '^\s*Backends' "$LOG" | head -30 || true
+          fi
+          # 强断言：configure 阶段如果 barebone 没启用，meson 会报
+          # "Dependency quickjs not found" 之类，configure 本身就失败了。
+          echo "configure 成功 = barebone 依赖已满足"
+
+  # ────────────────────────────────────────────────
+  # Job 2: 完整编译
+  # ─────────────────────────────────────────────────
+  build:
+    needs: configure-check
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout frida
+        uses: actions/checkout@v4
+        with:
+          repository: frida/frida
+          ref: ${{ env.FRIDA_REF }}
+          submodules: false
+
+      - name: Fetch releng + frida-core + frida-gum
+        run: |
+          git submodule update --init --depth 1 releng
+          cd releng && git submodule update --init --depth 1
+          cd "$GITHUB_WORKSPACE"
+          python3 tools/ensure-submodules.py frida-core
+          python3 tools/ensure-submodules.py frida-gum
+
+      - name: Set up NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.ANDROID_NDK_VERSION }}
+          add-to-path: false
+
+      - name: Export NDK root
+        run: |
+          echo "ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build python3-pip pkg-config \
+            valac libglib2.0-dev libgee-0.8-dev \
+            libjson-glib-dev libsoup-3.0-dev \
+            libssl-dev bison flex \
+            texinfo libtool autoconf automake
+          pip3 install --break-system-packages meson
+
+      - name: Configure (barebone enabled)
+        run: |
+          set -x
+          ./configure \
+            "--prefix=$FRIDA_PREFIX" \
+            --host=android-arm64 \
+            --enable-server \
+            --enable-barebone-backend \
+            --enable-portal \
+            -- \
+            -Dfrida-gum:devkits=gum,gumjs \
+            -Dfrida-core:devkits=core \
+            -Dfrida-core:compiler_backend=disabled
+
+      - name: Compile
+        run: make -j$(nproc)
+
+      - name: Install
+        run: make install
+
+      - name: Inspect frida-server
+        run: |
+          S="$FRIDA_PREFIX/bin/frida-server"
+          ls -la "$S"
+          echo "=== file type ==="
+          file "$S" || true
+          echo "=== version ==="
+          "$S" --version || true
+          echo
+          echo "=== barebone backend present? ==="
+          echo -n "GDB Remote Stub occurrences : "
+          strings "$S" | grep -c 'GDB Remote Stub' || true
+          echo -n "Frida.Barebone.* occurrences: "
+          strings "$S" | grep -c '^Frida\.Barebone\.' || true
+          echo
+          echo "=== barebone-ish strings ==="
+          strings "$S" | grep -i barebone | sort -u | head -20
+
+      - name: Assert barebone compiled in
+        run: |
+          S="$FRIDA_PREFIX/bin/frida-server"
+          N=$(strings "$S" | grep -c 'GDB Remote Stub' || true)
+          echo "GDB Remote Stub = $N"
+          if [ "$N" -lt 1 ]; then
+            echo "::error::barebone backend NOT compiled in"
+            exit 1
+          fi
+          echo "OK: barebone backend is present"
+
+      - name: Pack
+        run: |
+          mkdir -p /tmp/out
+          cp "$FRIDA_PREFIX/bin/frida-server" /tmp/out/
+          # 顺带打上版本信息
+          "$FRIDA_PREFIX/bin/frida-server" --version > /tmp/out/version.txt 2>&1 || true
+          git -C "$GITHUB_WORKSPACE" rev-parse HEAD > /tmp/out/frida-commit.txt
+          ls -la /tmp/out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frida-server-barebone-android-arm64
+          path: /tmp/out
