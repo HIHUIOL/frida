@@ -1,0 +1,353 @@
+name: Build frida-agent.ko (arm64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      frida_ref:
+        description: "frida repo ref (branch/tag/commit)"
+        required: false
+        default: "main"
+      agent_flavor:
+        description: "agent flavor: linux (kmod) or linux-injected"
+        required: false
+        default: "linux"
+
+permissions:
+  contents: read
+
+env:
+  MACHINE_PIC: none-arm64-softfloat_pic
+  MACHINE_NOPIC: none-arm64-softfloat_nopic
+
+jobs:
+  # ---------------------------------------------------------------- 1. SDK
+  sdk:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout frida
+        uses: actions/checkout@v4
+        with:
+          repository: frida/frida
+          ref: ${{ inputs.frida_ref }}
+          submodules: false
+
+      - name: Fetch releng
+        run: |
+          git submodule update --init --depth 1 releng
+          cd releng && git submodule update --init --depth 1
+
+      - name: Download SDKs
+        run: |
+          python3 releng/deps.py sync sdk "$MACHINE_PIC"   "$RUNNER_WORKSPACE/sdk-pic"
+          python3 releng/deps.py sync sdk "$MACHINE_NOPIC" "$RUNNER_WORKSPACE/sdk-nopic"
+          ls -la "$RUNNER_WORKSPACE/sdk-pic" | head
+          ls -la "$RUNNER_WORKSPACE/sdk-nopic" | head
+
+      - name: Report SDK contents
+        run: |
+          echo "=== pic include ==="
+          ls "$RUNNER_WORKSPACE/sdk-pic/include" | head -20
+          echo "=== pic lib ==="
+          ls "$RUNNER_WORKSPACE/sdk-pic/lib" | head -20
+
+      - name: Pack
+        run: |
+          mkdir -p /tmp/out
+          tar -cJf /tmp/out/sdk-pic.tar.xz   -C "$RUNNER_WORKSPACE" sdk-pic
+          tar -cJf /tmp/out/sdk-nopic.tar.xz -C "$RUNNER_WORKSPACE" sdk-nopic
+          ls -la /tmp/out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdk
+          path: /tmp/out
+
+  # ------------------------------------------------------------ 2. GumJS devkit
+  gumjs-devkit:
+    needs: sdk
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout frida
+        uses: actions/checkout@v4
+        with:
+          repository: frida/frida
+          ref: ${{ inputs.frida_ref }}
+          submodules: false
+
+      - name: Fetch frida-gum + releng
+        run: |
+          git submodule update --init --depth 1 releng
+          cd releng && git submodule update --init --depth 1
+          cd "$GITHUB_WORKSPACE"
+          python3 tools/ensure-submodules.py frida-gum
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdk
+          path: /tmp/sdk
+
+      - name: Unpack SDK
+        run: |
+          mkdir -p "$RUNNER_WORKSPACE"
+          tar -xJf /tmp/sdk/sdk-pic.tar.xz -C "$RUNNER_WORKSPACE"
+
+      - name: Install LLVM
+        run: |
+          curl -sSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 21
+          echo "/usr/lib/llvm-21/bin" >> $GITHUB_PATH
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build python3-pip pkg-config
+          pip3 install --break-system-packages meson
+
+      - name: Configure frida-gum
+        working-directory: subprojects/frida-gum
+        env:
+          CC: clang
+          CXX: clang++
+          PKG_CONFIG_LIBDIR: ${{ runner.workspace }}/sdk-pic/lib/pkgconfig
+          PKG_CONFIG_PATH: ${{ runner.workspace }}/sdk-pic/lib/pkgconfig
+        run: |
+          export PATH=/usr/lib/llvm-21/bin:$PATH
+          ./configure \
+            --host="$MACHINE_PIC" \
+            --enable-gumjs \
+            --with-devkits=gum,gumjs \
+            --with-devkit-symbol-scope=original
+
+      - name: Compile frida-gum
+        working-directory: subprojects/frida-gum
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          export PATH=/usr/lib/llvm-21/bin:$PATH
+          make -j$(nproc)
+
+      - name: Report devkit
+        run: |
+          ls -la subprojects/frida-gum/build/bindings/gumjs/devkit/ || true
+          ls -la subprojects/frida-gum/build/gum/devkit/ || true
+
+      - name: Pack devkit
+        run: |
+          mkdir -p /tmp/out
+          tar -cJf /tmp/out/gumjs-devkit.tar.xz \
+            -C "$GITHUB_WORKSPACE/subprojects/frida-gum/build/bindings/gumjs" devkit
+          ls -la /tmp/out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gumjs-devkit
+          path: /tmp/out
+
+  # -------------------------------------------------------------- 3. Rust agent
+  agent:
+    needs: [sdk, gumjs-devkit]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout frida
+        uses: actions/checkout@v4
+        with:
+          repository: frida/frida
+          ref: ${{ inputs.frida_ref }}
+          submodules: false
+
+      - name: Fetch frida-core + releng
+        run: |
+          git submodule update --init --depth 1 releng
+          cd releng && git submodule update --init --depth 1
+          cd "$GITHUB_WORKSPACE"
+          python3 tools/ensure-submodules.py frida-core
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdk
+          path: /tmp/sdk
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: gumjs-devkit
+          path: /tmp/devkit
+
+      - name: Unpack SDK + devkit
+        run: |
+          mkdir -p "$RUNNER_WORKSPACE"
+          tar -xJf /tmp/sdk/sdk-nopic.tar.xz -C "$RUNNER_WORKSPACE"
+          tar -xJf /tmp/devkit/gumjs-devkit.tar.xz -C "$RUNNER_WORKSPACE"
+          ls -la "$RUNNER_WORKSPACE"
+          ls -la "$RUNNER_WORKSPACE/devkit"
+
+      - name: Install LLVM 21
+        run: |
+          curl -sSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 21
+          echo "/usr/lib/llvm-21/bin" >> $GITHUB_PATH
+
+      - name: Install binutils + deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu ninja-build
+          which aarch64-linux-gnu-nm aarch64-linux-gnu-ar aarch64-linux-gnu-ld || true
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup default nightly
+          rustup component add rust-src
+          rustup target add aarch64-unknown-none
+          rustc --version
+          cargo --version
+
+      - name: Show agent tree
+        run: |
+          ls -la subprojects/frida-core/src/barebone/agent/
+          ls -la subprojects/frida-core/src/barebone/agent/linux/
+
+      - name: Build agent (cargo, --features linux)
+        working-directory: subprojects/frida-core/src/barebone/agent
+        env:
+          GUMJS_DEVKIT_DIR: ${{ runner.workspace }}/devkit
+          FRIDA_SDK: ${{ runner.workspace }}/sdk-nopic
+          RUSTC_BOOTSTRAP: "1"
+          AGENT_CC: clang-21
+        run: |
+          export PATH=/usr/lib/llvm-21/bin:$PATH
+          RUSTFLAGS="-Zfixed-x18" \
+          CC_aarch64_unknown_none="clang --target=aarch64-none-elf -mabi=aapcs-soft -mgeneral-regs-only -ffixed-x18 -fno-pic --sysroot=$FRIDA_SDK -isystem $FRIDA_SDK/include -I$FRIDA_SDK/include/glib-2.0 -I$FRIDA_SDK/lib/glib-2.0/include -I$FRIDA_SDK/include/capstone -I$FRIDA_SDK/include/json-glib-1.0" \
+          cargo build --release --target aarch64-unknown-none \
+            --features "${{ inputs.agent_flavor }}" \
+            --target-dir target-linux \
+            -Z build-std=core,alloc,compiler_builtins
+
+      - name: Report agent lib
+        run: |
+          ls -la subprojects/frida-core/src/barebone/agent/target-linux/aarch64-unknown-none/release/ || true
+
+      - name: Pack agent
+        run: |
+          mkdir -p /tmp/out
+          tar -cJf /tmp/out/agent-lib.tar.xz \
+            -C "$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent" \
+            target-linux
+          ls -la /tmp/out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-lib
+          path: /tmp/out
+
+  # ------------------------------------------------------------------ 4. kmod
+  kmod:
+    needs: [agent]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout frida
+        uses: actions/checkout@v4
+        with:
+          repository: frida/frida
+          ref: ${{ inputs.frida_ref }}
+          submodules: false
+
+      - name: Fetch frida-core + releng
+        run: |
+          git submodule update --init --depth 1 releng
+          cd releng && git submodule update --init --depth 1
+          cd "$GITHUB_WORKSPACE"
+          python3 tools/ensure-submodules.py frida-core
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdk
+          path: /tmp/sdk
+      - uses: actions/download-artifact@v4
+        with:
+          name: gumjs-devkit
+          path: /tmp/devkit
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-lib
+          path: /tmp/agent
+
+      - name: Unpack everything
+        run: |
+          mkdir -p "$RUNNER_WORKSPACE"
+          tar -xJf /tmp/sdk/sdk-nopic.tar.xz     -C "$RUNNER_WORKSPACE"
+          tar -xJf /tmp/devkit/gumjs-devkit.tar.xz -C "$RUNNER_WORKSPACE"
+          tar -xJf /tmp/agent/agent-lib.tar.xz \
+            -C "$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent"
+
+      - name: Install LLVM 21 + binutils
+        run: |
+          curl -sSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 21
+          echo "/usr/lib/llvm-21/bin" >> $GITHUB_PATH
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu bison flex libssl-dev libelf-dev bc kmod
+
+      - name: Fetch kernel source
+        run: |
+          cd "$RUNNER_WORKSPACE"
+          git clone --depth 1 -b android16-6.12-2025-06 \
+            https://github.com/cctv18/android_gki_kernel_common.git ksrc
+          du -sh ksrc
+          ls ksrc | head
+
+      - name: Prepare kernel tree (defconfig + modules_prepare)
+        working-directory: ${{ runner.workspace }}/ksrc
+        env:
+          LLVM: "1"
+        run: |
+          export PATH=/usr/lib/llvm-21/bin:$PATH
+          make ARCH=arm64 LLVM=1 O=out gki_defconfig
+          make ARCH=arm64 LLVM=1 O=out -j$(nproc) modules_prepare
+
+      - name: Build frida-agent.ko
+        working-directory: ${{ github.workspace }}/subprojects/frida-core/src/barebone/agent/linux
+        env:
+          GUMJS_DEVKIT_DIR: ${{ runner.workspace }}/devkit
+          FRIDA_SDK: ${{ runner.workspace }}/sdk-nopic
+          KDIR: ${{ runner.workspace }}/ksrc
+          KOUT: ${{ runner.workspace }}/ksrc/out
+          ARCH: arm64
+          TOOLPREFIX: aarch64-linux-gnu-
+          AGENT_LD: aarch64-linux-gnu-ld
+          AGENT_AR: aarch64-linux-gnu-ar
+          AGENT_NM: aarch64-linux-gnu-nm
+          AGENT_OBJCOPY: aarch64-linux-gnu-objcopy
+          AGENT_CC: clang
+          MODULE_NAME: frida-agent
+        run: |
+          export PATH=/usr/lib/llvm-21/bin:$PATH
+          echo "=== env check ==="
+          echo "GUMJS_DEVKIT_DIR=$GUMJS_DEVKIT_DIR"
+          ls -la "$GUMJS_DEVKIT_DIR" | head
+          echo "FRIDA_SDK=$FRIDA_SDK"
+          echo "=== make ==="
+          make -j$(nproc)
+
+      - name: Report result
+        run: |
+          D="$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent/linux"
+          ls -la "$D"
+          file "$D/frida-agent.ko" || true
+          strings "$D/frida-agent.ko" | grep -i vermagic || true
+
+      - name: Pack ko
+        run: |
+          mkdir -p /tmp/out
+          D="$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent/linux"
+          cp "$D"/*.ko /tmp/out/ 2>/dev/null || true
+          cp "$D"/frida-agent-prelinked.o.bin /tmp/out/ 2>/dev/null || true
+          ls -la /tmp/out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frida-agent-ko
+          path: /tmp/out
