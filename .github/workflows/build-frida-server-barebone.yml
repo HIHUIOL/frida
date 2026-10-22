@@ -100,9 +100,9 @@ jobs:
             "--prefix=$FRIDA_PREFIX" \
             --host=android-arm64 \
             --enable-server \
-            --enable-barebone-backend \
             --enable-portal \
             -- \
+            -Dbarebone_backend=enabled \
             -Dfrida-gum:devkits=gum,gumjs \
             -Dfrida-core:devkits=core \
             -Dfrida-core:compiler_backend=disabled
@@ -192,9 +192,9 @@ jobs:
             "--prefix=$FRIDA_PREFIX" \
             --host=android-arm64 \
             --enable-server \
-            --enable-barebone-backend \
             --enable-portal \
             -- \
+            -Dbarebone_backend=enabled \
             -Dfrida-gum:devkits=gum,gumjs \
             -Dfrida-core:devkits=core \
             -Dfrida-core:compiler_backend=disabled
