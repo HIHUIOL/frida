@@ -55,6 +55,15 @@ def patch(path: pathlib.Path) -> None:
         "const struct frida_kernel_symbol * sym",
     )
 
+    # --- 2b. mod->syms is a pointer to the incomplete struct kernel_symbol, so
+    #         mod->syms[i] cannot be indexed; do the pointer arithmetic on the
+    #         mirrored type instead.
+    src = src.replace(
+        "const struct frida_kernel_symbol * sym = &mod->syms[i];",
+        "const struct frida_kernel_symbol * sym =\n"
+        "            ((const struct frida_kernel_symbol *) mod->syms) + i;",
+    )
+
     # --- 3. CONFIG_SYSVIPC guard ---
     src = src.replace(
         "  void * undo_list = leader->sysvsem.undo_list;",
