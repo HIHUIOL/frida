@@ -295,6 +295,22 @@ jobs:
         run: |
           export PATH=/usr/lib/llvm-21/bin:$PATH
           make ARCH=arm64 LLVM=1 O=out gki_defconfig
+
+          # The device kernel enables CONFIG_RUST, which selects
+          # CFI_ICALL_NORMALIZE_INTEGERS, which adds
+          # -fsanitize-cfi-icall-experimental-normalize-integers to CC_FLAGS_CFI.
+          # Without it every KCFI type id in our module is missing the
+          # ".normalized" suffix and therefore mismatches the device:
+          #   int(void)             -> 0x36b1c5a6   (wrong)
+          #   int(void).normalized  -> 0x6fbb3035   (device value)
+          echo "CONFIG_CFI_ICALL_NORMALIZE_INTEGERS=y" >> out/.config
+          ./scripts/config --file out/.config \
+            -e CFI_ICALL_NORMALIZE_INTEGERS
+          grep -E 'CFI_ICALL_NORMALIZE' out/.config
+
+          make ARCH=arm64 LLVM=1 O=out olddefconfig
+          grep -E 'CONFIG_CFI' out/.config
+
           make ARCH=arm64 LLVM=1 O=out -j$(nproc) modules_prepare
 
       - name: Inject Module.symvers (device CRCs)
@@ -394,19 +410,27 @@ jobs:
 
       - name: Patch KCFI type hashes
         run: |
-          # The device kernel was built with clang 19.0.1 (r536225); CI uses
-          # clang 21, whose KCFI type-hash differs. Under strict KCFI
-          # (# CONFIG_CFI_PERMISSIVE is not set) the kernel traps when
-          # do_one_initcall() compares mod->init's hash, so the module must
-          # carry the device's values: 0x6fbb3035 / 0xe5c47d60.
+          # With CONFIG_CFI_ICALL_NORMALIZE_INTEGERS=y the compiler now emits
+          # the device's own type ids, so nothing should need patching.
+          # Verify instead, and only patch if something is still off.
           D="$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent/linux"
           KO="$D/frida-agent.ko"
-          INIT_OFF=$(readelf -S -W "$KO" | awk '$2==".init.text"{print $5}')
-          EXIT_OFF=$(readelf -S -W "$KO" | awk '$2==".exit.text"{print $5}')
-          echo "init offset=$INIT_OFF exit offset=$EXIT_OFF"
-          # readelf prints bare hex; bash needs the 0x prefix for arithmetic
-          printf '\x35\x30\xbb\x6f' | dd of="$KO" bs=1 seek=$((0x$INIT_OFF)) conv=notrunc
-          printf '\x60\x7d\xc4\xe5' | dd of="$KO" bs=1 seek=$((0x$EXIT_OFF)) conv=notrunc
+          llvm-objcopy -O binary --only-section=.init.text "$KO" /tmp/i2.bin 2>/dev/null
+          llvm-objcopy -O binary --only-section=.exit.text "$KO" /tmp/e2.bin 2>/dev/null
+          INIT=$(od -A n -t x1 -N 4 /tmp/i2.bin | tr -d ' \n')
+          EXIT=$(od -A n -t x1 -N 4 /tmp/e2.bin | tr -d ' \n')
+          echo "init_module    = $INIT  (device expects 3530bb6f)"
+          echo "cleanup_module = $EXIT  (device expects 607dc4e5)"
+          if [ "$INIT" = "3530bb6f" ] && [ "$EXIT" = "607dc4e5" ]; then
+            echo "KCFI OK - no patch needed"
+          else
+            echo "MISMATCH - patching"
+            INIT_OFF=$(readelf -S -W "$KO" | awk '$2==".init.text"{print $5}')
+            EXIT_OFF=$(readelf -S -W "$KO" | awk '$2==".exit.text"{print $5}')
+            printf '\x35\x30\xbb\x6f' | dd of="$KO" bs=1 seek=$((0x$INIT_OFF)) conv=notrunc
+            printf '\x60\x7d\xc4\xe5' | dd of="$KO" bs=1 seek=$((0x$EXIT_OFF)) conv=notrunc
+            echo "patched"
+          fi
           echo "=== KCFI after patch ==="
           llvm-objcopy -O binary --only-section=.init.text "$KO" /tmp/i2.bin 2>/dev/null
           od -A n -t x1 -N 4 /tmp/i2.bin
