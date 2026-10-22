@@ -289,7 +289,9 @@ jobs:
           sudo /tmp/llvm.sh 21
           echo "/usr/lib/llvm-21/bin" >> $GITHUB_PATH
           sudo apt-get update
-          sudo apt-get install -y binutils-aarch64-linux-gnu bison flex libssl-dev libelf-dev bc kmod
+          sudo apt-get install -y binutils-aarch64-linux-gnu bison flex libssl-dev libelf-dev bc kmod \
+            libdw-dev libdwarf-dev zlib1g-dev libiberty-dev dwarves pahole cpio rsync \
+            gcc-aarch64-linux-gnu
 
       - name: Fetch kernel source
         run: |
@@ -298,6 +300,7 @@ jobs:
             https://github.com/cctv18/android_gki_kernel_common.git ksrc
           du -sh ksrc
           ls ksrc | head
+          ls ksrc/scripts/gendwarfksyms/ || true
 
       - name: Prepare kernel tree (defconfig + modules_prepare)
         working-directory: ${{ runner.workspace }}/ksrc
@@ -305,8 +308,18 @@ jobs:
           LLVM: "1"
         run: |
           export PATH=/usr/lib/llvm-21/bin:$PATH
-          make ARCH=arm64 LLVM=1 O=out gki_defconfig
-          make ARCH=arm64 LLVM=1 O=out -j$(nproc) modules_prepare
+          echo "=== dwarf.h 位置 ==="
+          find /usr/include -name 'dwarf.h' 2>/dev/null
+          echo "=== defconfig ==="
+          make ARCH=arm64 LLVM=1 O=out gki_defconfig || {
+            echo "--- defconfig 失败，输出末尾 ---"
+            exit 1
+          }
+          echo "=== modules_prepare ==="
+          make ARCH=arm64 LLVM=1 O=out -j$(nproc) modules_prepare || {
+            echo "--- modules_prepare 失败 ---"
+            exit 1
+          }
 
       - name: Build frida-agent.ko
         working-directory: ${{ github.workspace }}/subprojects/frida-core/src/barebone/agent/linux
