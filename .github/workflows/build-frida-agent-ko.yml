@@ -18,9 +18,10 @@ permissions:
 env:
   MACHINE_PIC: none-arm64-softfloat_pic
   MACHINE_NOPIC: none-arm64-softfloat_nopic
+  KVER_BRANCH: android16-6.12-2025-06
+  KVER_REPO: https://github.com/cctv18/android_gki_kernel_common.git
 
 jobs:
-  # ---------------------------------------------------------------- 1. SDK
   sdk:
     runs-on: ubuntu-24.04
     steps:
@@ -40,15 +41,7 @@ jobs:
         run: |
           python3 releng/deps.py sync sdk "$MACHINE_PIC"   "$RUNNER_WORKSPACE/sdk-pic"
           python3 releng/deps.py sync sdk "$MACHINE_NOPIC" "$RUNNER_WORKSPACE/sdk-nopic"
-          ls -la "$RUNNER_WORKSPACE/sdk-pic" | head
-          ls -la "$RUNNER_WORKSPACE/sdk-nopic" | head
-
-      - name: Report SDK contents
-        run: |
-          echo "=== pic include ==="
-          ls "$RUNNER_WORKSPACE/sdk-pic/include" | head -20
-          echo "=== pic lib ==="
-          ls "$RUNNER_WORKSPACE/sdk-pic/lib" | head -20
+          ls "$RUNNER_WORKSPACE/sdk-pic/include" | head
 
       - name: Pack
         run: |
@@ -62,7 +55,6 @@ jobs:
           name: sdk
           path: /tmp/out
 
-  # ------------------------------------------------------------ 2. GumJS devkit
   gumjs-devkit:
     needs: sdk
     runs-on: ubuntu-24.04
@@ -109,8 +101,6 @@ jobs:
         env:
           CC: clang
           CXX: clang++
-          PKG_CONFIG_LIBDIR: ${{ runner.workspace }}/sdk-pic/lib/pkgconfig
-          PKG_CONFIG_PATH: ${{ runner.workspace }}/sdk-pic/lib/pkgconfig
         run: |
           export PATH=/usr/lib/llvm-21/bin:$PATH
           ./configure \
@@ -128,14 +118,10 @@ jobs:
           export PATH=/usr/lib/llvm-21/bin:$PATH
           make -j$(nproc)
 
-      - name: Report devkit
-        run: |
-          ls -la subprojects/frida-gum/build/bindings/gumjs/devkit/ || true
-          ls -la subprojects/frida-gum/build/gum/devkit/ || true
-
       - name: Pack devkit
         run: |
           mkdir -p /tmp/out
+          ls -la subprojects/frida-gum/build/bindings/gumjs/devkit/ || true
           tar -cJf /tmp/out/gumjs-devkit.tar.xz \
             -C "$GITHUB_WORKSPACE/subprojects/frida-gum/build/bindings/gumjs" devkit
           ls -la /tmp/out
@@ -145,7 +131,6 @@ jobs:
           name: gumjs-devkit
           path: /tmp/out
 
-  # -------------------------------------------------------------- 3. Rust agent
   agent:
     needs: [sdk, gumjs-devkit]
     runs-on: ubuntu-24.04
@@ -168,7 +153,6 @@ jobs:
         with:
           name: sdk
           path: /tmp/sdk
-
       - uses: actions/download-artifact@v4
         with:
           name: gumjs-devkit
@@ -179,7 +163,6 @@ jobs:
           mkdir -p "$RUNNER_WORKSPACE"
           tar -xJf /tmp/sdk/sdk-nopic.tar.xz -C "$RUNNER_WORKSPACE"
           tar -xJf /tmp/devkit/gumjs-devkit.tar.xz -C "$RUNNER_WORKSPACE"
-          ls -la "$RUNNER_WORKSPACE"
           ls -la "$RUNNER_WORKSPACE/devkit"
 
       - name: Install LLVM 21
@@ -189,11 +172,11 @@ jobs:
           sudo /tmp/llvm.sh 21
           echo "/usr/lib/llvm-21/bin" >> $GITHUB_PATH
 
-      - name: Install binutils + deps
+      - name: Install binutils
         run: |
           sudo apt-get update
           sudo apt-get install -y binutils-aarch64-linux-gnu ninja-build
-          which aarch64-linux-gnu-nm aarch64-linux-gnu-ar aarch64-linux-gnu-ld || true
+          which aarch64-linux-gnu-nm aarch64-linux-gnu-ar aarch64-linux-gnu-ld
 
       - name: Set up Rust
         run: |
@@ -202,12 +185,6 @@ jobs:
           rustup component add rust-src
           rustup target add aarch64-unknown-none
           rustc --version
-          cargo --version
-
-      - name: Show agent tree
-        run: |
-          ls -la subprojects/frida-core/src/barebone/agent/
-          ls -la subprojects/frida-core/src/barebone/agent/linux/
 
       - name: Build agent (cargo, --features linux)
         working-directory: subprojects/frida-core/src/barebone/agent
@@ -215,7 +192,6 @@ jobs:
           GUMJS_DEVKIT_DIR: ${{ runner.workspace }}/devkit
           FRIDA_SDK: ${{ runner.workspace }}/sdk-nopic
           RUSTC_BOOTSTRAP: "1"
-          AGENT_CC: clang-21
         run: |
           export PATH=/usr/lib/llvm-21/bin:$PATH
           RUSTFLAGS="-Zfixed-x18" \
@@ -225,16 +201,12 @@ jobs:
             --target-dir target-linux \
             -Z build-std=core,alloc,compiler_builtins
 
-      - name: Report agent lib
-        run: |
-          ls -la subprojects/frida-core/src/barebone/agent/target-linux/aarch64-unknown-none/release/ || true
-
       - name: Pack agent
         run: |
           mkdir -p /tmp/out
+          ls -la subprojects/frida-core/src/barebone/agent/target-linux/aarch64-unknown-none/release/ || true
           tar -cJf /tmp/out/agent-lib.tar.xz \
-            -C "$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent" \
-            target-linux
+            -C "$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent" target-linux
           ls -la /tmp/out
 
       - uses: actions/upload-artifact@v4
@@ -242,7 +214,6 @@ jobs:
           name: agent-lib
           path: /tmp/out
 
-  # ------------------------------------------------------------------ 4. kmod
   kmod:
     needs: [agent]
     runs-on: ubuntu-24.04
@@ -277,110 +248,83 @@ jobs:
       - name: Unpack everything
         run: |
           mkdir -p "$RUNNER_WORKSPACE"
-          tar -xJf /tmp/sdk/sdk-nopic.tar.xz     -C "$RUNNER_WORKSPACE"
+          tar -xJf /tmp/sdk/sdk-nopic.tar.xz       -C "$RUNNER_WORKSPACE"
           tar -xJf /tmp/devkit/gumjs-devkit.tar.xz -C "$RUNNER_WORKSPACE"
           tar -xJf /tmp/agent/agent-lib.tar.xz \
             -C "$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent"
 
-      - name: Install LLVM 21 + binutils
+      - name: Install LLVM 21 + binutils + kernel deps
         run: |
           curl -sSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
           chmod +x /tmp/llvm.sh
           sudo /tmp/llvm.sh 21
           echo "/usr/lib/llvm-21/bin" >> $GITHUB_PATH
           sudo apt-get update
-          sudo apt-get install -y binutils-aarch64-linux-gnu bison flex libssl-dev libelf-dev bc kmod \
-            libdw-dev libdwarf-dev zlib1g-dev libiberty-dev dwarves pahole cpio rsync \
-            gcc-aarch64-linux-gnu
+          sudo apt-get install -y binutils-aarch64-linux-gnu bison flex libssl-dev \
+            libelf-dev bc kmod libdw-dev libdwarf-dev zlib1g-dev libiberty-dev \
+            dwarves pahole cpio rsync
+
+      - name: Patch frida-kmod.c for 6.12 GKI
+        run: |
+          F="$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent/linux/frida-kmod.c"
+          cp "$F" "$F.orig"
+          python3 "$GITHUB_WORKSPACE/.ci/patch_frida_kmod.py" "$F"
+          echo "=== diff ==="
+          diff -u "$F.orig" "$F" || true
 
       - name: Fetch kernel source
         run: |
           cd "$RUNNER_WORKSPACE"
-          git clone --depth 1 -b android16-6.12-2025-06 \
-            https://github.com/cctv18/android_gki_kernel_common.git ksrc
+          git clone --depth 1 -b "$KVER_BRANCH" "$KVER_REPO" ksrc
           du -sh ksrc
-          ls ksrc | head
-          ls ksrc/scripts/gendwarfksyms/ || true
 
-      - name: Prepare kernel tree (defconfig + modules_prepare)
+      - name: Prepare kernel tree
         working-directory: ${{ runner.workspace }}/ksrc
         env:
           LLVM: "1"
         run: |
           export PATH=/usr/lib/llvm-21/bin:$PATH
-          echo "=== dwarf.h 位置 ==="
-          find /usr/include -name 'dwarf.h' 2>/dev/null
-          echo "=== defconfig ==="
-          make ARCH=arm64 LLVM=1 O=out gki_defconfig || {
-            echo "--- defconfig 失败，输出末尾 ---"
-            exit 1
-          }
-          echo "=== modules_prepare ==="
-          make ARCH=arm64 LLVM=1 O=out -j$(nproc) modules_prepare || {
-            echo "--- modules_prepare 失败 ---"
-            exit 1
-          }
+          make ARCH=arm64 LLVM=1 O=out gki_defconfig
+          make ARCH=arm64 LLVM=1 O=out -j$(nproc) modules_prepare
 
-      - name: Build frida-agent.ko
+      - name: Pre-link agent objects
         working-directory: ${{ github.workspace }}/subprojects/frida-core/src/barebone/agent/linux
         env:
           GUMJS_DEVKIT_DIR: ${{ runner.workspace }}/devkit
           FRIDA_SDK: ${{ runner.workspace }}/sdk-nopic
-          KDIR: ${{ runner.workspace }}/ksrc
-          KOUT: ${{ runner.workspace }}/ksrc/out
-          ARCH: arm64
-          TOOLPREFIX: aarch64-linux-gnu-
-          AGENT_LD: aarch64-linux-gnu-ld
-          AGENT_AR: aarch64-linux-gnu-ar
-          AGENT_NM: aarch64-linux-gnu-nm
-          AGENT_OBJCOPY: aarch64-linux-gnu-objcopy
-          AGENT_CC: clang
-          MODULE_NAME: frida-agent
+          PREFIX: aarch64-linux-gnu-
         run: |
-          export PATH=/usr/lib/llvm-21/bin:$PATH
           set -x
           AGENT_DIR="$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent"
           AGENT_LIB="$AGENT_DIR/target-linux/aarch64-unknown-none/release/libfrida_barebone_agent.a"
-          echo "=== agent lib ==="
           ls -la "$AGENT_LIB"
-          echo "=== devkit ==="
-          ls -la "$GUMJS_DEVKIT_DIR"
-          echo "=== sdk lib ==="
-          ls "$FRIDA_SDK/lib" | head -20
 
-          # ---- step 1: 复制 agent 静态库 ----
-          AGENT_LIB_SOFTFLOAT="$AGENT_DIR/target-linux/libfrida-barebone-agent-softfloat.a"
-          cp "$AGENT_LIB" "$AGENT_LIB_SOFTFLOAT"
+          SF="$AGENT_DIR/target-linux/libfrida-barebone-agent-softfloat.a"
+          cp "$AGENT_LIB" "$SF"
 
-          # ---- step 2: arm64 需要丢掉硬浮点 compiler_builtins ----
-          DOBJ=$($AGENT_NM --print-armap "$AGENT_LIB_SOFTFLOAT" | sed -n 's/^__muldf3 in //p')
-          if [ -n "$DOBJ" ]; then
-            $AGENT_AR d "$AGENT_LIB_SOFTFLOAT" $DOBJ
-          fi
-          $AGENT_AR s "$AGENT_LIB_SOFTFLOAT"
+          DOBJ=$(${PREFIX}nm --print-armap "$SF" | sed -n 's/^__muldf3 in //p')
+          if [ -n "$DOBJ" ]; then ${PREFIX}ar d "$SF" $DOBJ; fi
+          ${PREFIX}ar s "$SF"
 
-          # ---- step 3: 裁剪 libc ----
           LIBC="$AGENT_DIR/target-linux/libc-trimmed.a"
           cp "$FRIDA_SDK/lib/libc.a" "$LIBC"
-          $AGENT_NM --defined-only "$AGENT_LIB_SOFTFLOAT" \
+          ${PREFIX}nm --defined-only "$SF" \
             | awk 'NF == 3 && $2 ~ /^[TDBR]$/ { print $3 }' | sort -u > "$LIBC.agent-syms"
-          $AGENT_NM --print-armap "$LIBC" | sed -n 's/^\([^ ]*\) in \(.*\)$/\1 \2/p' | sort -u > "$LIBC.members"
-          $AGENT_AR d "$LIBC" $(join "$LIBC.agent-syms" "$LIBC.members" | awk '{ print $2 }' | sort -u) || true
-          $AGENT_AR s "$LIBC"
+          ${PREFIX}nm --print-armap "$LIBC" | sed -n 's/^\([^ ]*\) in \(.*\)$/\1 \2/p' | sort -u > "$LIBC.members"
+          ${PREFIX}ar d "$LIBC" $(join "$LIBC.agent-syms" "$LIBC.members" | awk '{ print $2 }' | sort -u) || true
+          ${PREFIX}ar s "$LIBC"
           rm -f "$LIBC.agent-syms" "$LIBC.members"
 
-          # ---- step 4: prelink ----
           PRELINKED="frida-agent-prelinked.o.bin"
-          $AGENT_LD -r -T prelink.lds -o "$PRELINKED.tmp" \
-            --whole-archive "$AGENT_LIB_SOFTFLOAT" --no-whole-archive \
+          ${PREFIX}ld -r -T prelink.lds -o "$PRELINKED.tmp" \
+            --whole-archive "$SF" --no-whole-archive \
             --start-group \
               "$GUMJS_DEVKIT_DIR/libfrida-gumjs.a" \
               "$LIBC" \
               "$FRIDA_SDK/lib/libm.a" \
               "$FRIDA_SDK/lib/libclang_rt.builtins.a" \
             --end-group
-
-          $AGENT_OBJCOPY \
+          ${PREFIX}objcopy \
             --keep-global-symbol=frida_agent_start \
             --keep-global-symbol=frida_agent_stop \
             --keep-global-symbol=gum_interceptor_obtain \
@@ -388,46 +332,42 @@ jobs:
             --keep-global-symbol=gum_interceptor_end_transaction \
             --keep-global-symbol=gum_interceptor_replace \
             --keep-global-symbol=gum_interceptor_revert \
-            --strip-debug \
-            --remove-section=.llvmbc --remove-section=.llvmcmd \
+            --strip-debug --remove-section=.llvmbc --remove-section=.llvmcmd \
             "$PRELINKED.tmp" "$PRELINKED"
           rm -f "$PRELINKED.tmp"
           ls -la "$PRELINKED"
 
-          # ---- step 5: kbuild (必须 LLVM=1，否则用 gcc 不支持 KCFI) ----
-          FRIDA_KMOD_DEFS=""
-          grep -q 'list_head[[:space:]]*thread_group;' "$KDIR/include/linux/sched.h" && FRIDA_KMOD_DEFS="$FRIDA_KMOD_DEFS -DFRIDA_HAVE_TASK_THREAD_GROUP"
-          grep -q 'spinlock_t[[:space:]]*lock;' "$KDIR/include/linux/fs_struct.h" && FRIDA_KMOD_DEFS="$FRIDA_KMOD_DEFS -DFRIDA_HAVE_FS_STRUCT_LOCK"
-
-          which clang ld.lld llvm-objcopy
-          clang --version
-
+      - name: Build frida-agent.ko
+        working-directory: ${{ github.workspace }}/subprojects/frida-core/src/barebone/agent/linux
+        env:
+          KDIR: ${{ runner.workspace }}/ksrc
+          KOUT: ${{ runner.workspace }}/ksrc/out
+        run: |
+          export PATH=/usr/lib/llvm-21/bin:$PATH
+          DEFS=""
+          grep -q 'list_head[[:space:]]*thread_group;' "$KDIR/include/linux/sched.h" && DEFS="$DEFS -DFRIDA_HAVE_TASK_THREAD_GROUP"
+          grep -q 'spinlock_t[[:space:]]*lock;' "$KDIR/include/linux/fs_struct.h" && DEFS="$DEFS -DFRIDA_HAVE_FS_STRUCT_LOCK"
+          echo "DEFS=$DEFS"
           make -C "$KDIR" O="$KOUT" M="$PWD" ARCH=arm64 LLVM=1 \
-            FRIDA_KMOD_DEFS="$FRIDA_KMOD_DEFS" MODULE_NAME=frida-agent modules
+            FRIDA_KMOD_DEFS="$DEFS" MODULE_NAME=frida-agent modules
 
-      - name: Check KCFI type hashes (关键！必须与设备一致)
+      - name: Inspect result
         run: |
           D="$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent/linux"
+          ls -la "$D"
           KO="$D/frida-agent.ko"
           echo "=== file ==="
           file "$KO" || true
           echo "=== vermagic ==="
           strings "$KO" | grep -i 'vermagic=' || true
-          echo "=== section list ==="
-          llvm-readelf -S -W "$KO" 2>/dev/null | grep -E 'init\.text|exit\.text|this_module|__versions|modinfo' || true
-          echo "=== init_module 前 8 字节 (KCFI ID 应在开头) ==="
-          llvm-objdump -dr --section=.init.text "$KO" 2>/dev/null | head -20 || true
-          echo "=== exit_module 前 8 字节 ==="
-          llvm-objdump -dr --section=.exit.text "$KO" 2>/dev/null | head -20 || true
+          echo "=== init_module KCFI ID (device expects 0x6fbb3035 little-endian 3530bb6f) ==="
+          llvm-objcopy -O binary --only-section=.init.text "$KO" /tmp/i.bin 2>/dev/null
+          od -A n -t x1 -N 4 /tmp/i.bin 2>/dev/null
+          echo "=== exit_module KCFI ID (device expects 0xe5c47d60 little-endian 607dc4e5) ==="
+          llvm-objcopy -O binary --only-section=.exit.text "$KO" /tmp/e.bin 2>/dev/null
+          od -A n -t x1 -N 4 /tmp/e.bin 2>/dev/null
 
-      - name: Report result
-        run: |
-          D="$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent/linux"
-          ls -la "$D"
-          file "$D/frida-agent.ko" || true
-          strings "$D/frida-agent.ko" | grep -i vermagic || true
-
-      - name: Pack ko
+      - name: Pack output
         run: |
           mkdir -p /tmp/out
           D="$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent/linux"
