@@ -394,13 +394,31 @@ jobs:
           rm -f "$PRELINKED.tmp"
           ls -la "$PRELINKED"
 
-          # ---- step 5: kbuild ----
+          # ---- step 5: kbuild (必须 LLVM=1，否则用 gcc 不支持 KCFI) ----
           FRIDA_KMOD_DEFS=""
           grep -q 'list_head[[:space:]]*thread_group;' "$KDIR/include/linux/sched.h" && FRIDA_KMOD_DEFS="$FRIDA_KMOD_DEFS -DFRIDA_HAVE_TASK_THREAD_GROUP"
           grep -q 'spinlock_t[[:space:]]*lock;' "$KDIR/include/linux/fs_struct.h" && FRIDA_KMOD_DEFS="$FRIDA_KMOD_DEFS -DFRIDA_HAVE_FS_STRUCT_LOCK"
 
-          make -C "$KDIR" O="$KOUT" M="$PWD" ARCH=arm64 \
+          which clang ld.lld llvm-objcopy
+          clang --version
+
+          make -C "$KDIR" O="$KOUT" M="$PWD" ARCH=arm64 LLVM=1 \
             FRIDA_KMOD_DEFS="$FRIDA_KMOD_DEFS" MODULE_NAME=frida-agent modules
+
+      - name: Check KCFI type hashes (关键！必须与设备一致)
+        run: |
+          D="$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent/linux"
+          KO="$D/frida-agent.ko"
+          echo "=== file ==="
+          file "$KO" || true
+          echo "=== vermagic ==="
+          strings "$KO" | grep -i 'vermagic=' || true
+          echo "=== section list ==="
+          llvm-readelf -S -W "$KO" 2>/dev/null | grep -E 'init\.text|exit\.text|this_module|__versions|modinfo' || true
+          echo "=== init_module 前 8 字节 (KCFI ID 应在开头) ==="
+          llvm-objdump -dr --section=.init.text "$KO" 2>/dev/null | head -20 || true
+          echo "=== exit_module 前 8 字节 ==="
+          llvm-objdump -dr --section=.exit.text "$KO" 2>/dev/null | head -20 || true
 
       - name: Report result
         run: |
