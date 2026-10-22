@@ -338,12 +338,69 @@ jobs:
           MODULE_NAME: frida-agent
         run: |
           export PATH=/usr/lib/llvm-21/bin:$PATH
-          echo "=== env check ==="
-          echo "GUMJS_DEVKIT_DIR=$GUMJS_DEVKIT_DIR"
-          ls -la "$GUMJS_DEVKIT_DIR" | head
-          echo "FRIDA_SDK=$FRIDA_SDK"
-          echo "=== make ==="
-          make -j$(nproc)
+          set -x
+          AGENT_DIR="$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent"
+          AGENT_LIB="$AGENT_DIR/target-linux/aarch64-unknown-none/release/libfrida_barebone_agent.a"
+          echo "=== agent lib ==="
+          ls -la "$AGENT_LIB"
+          echo "=== devkit ==="
+          ls -la "$GUMJS_DEVKIT_DIR"
+          echo "=== sdk lib ==="
+          ls "$FRIDA_SDK/lib" | head -20
+
+          # ---- step 1: 复制 agent 静态库 ----
+          AGENT_LIB_SOFTFLOAT="$AGENT_DIR/target-linux/libfrida-barebone-agent-softfloat.a"
+          cp "$AGENT_LIB" "$AGENT_LIB_SOFTFLOAT"
+
+          # ---- step 2: arm64 需要丢掉硬浮点 compiler_builtins ----
+          DOBJ=$($AGENT_NM --print-armap "$AGENT_LIB_SOFTFLOAT" | sed -n 's/^__muldf3 in //p')
+          if [ -n "$DOBJ" ]; then
+            $AGENT_AR d "$AGENT_LIB_SOFTFLOAT" $DOBJ
+          fi
+          $AGENT_AR s "$AGENT_LIB_SOFTFLOAT"
+
+          # ---- step 3: 裁剪 libc ----
+          LIBC="$AGENT_DIR/target-linux/libc-trimmed.a"
+          cp "$FRIDA_SDK/lib/libc.a" "$LIBC"
+          $AGENT_NM --defined-only "$AGENT_LIB_SOFTFLOAT" \
+            | awk 'NF == 3 && $2 ~ /^[TDBR]$/ { print $3 }' | sort -u > "$LIBC.agent-syms"
+          $AGENT_NM --print-armap "$LIBC" | sed -n 's/^\([^ ]*\) in \(.*\)$/\1 \2/p' | sort -u > "$LIBC.members"
+          $AGENT_AR d "$LIBC" $(join "$LIBC.agent-syms" "$LIBC.members" | awk '{ print $2 }' | sort -u) || true
+          $AGENT_AR s "$LIBC"
+          rm -f "$LIBC.agent-syms" "$LIBC.members"
+
+          # ---- step 4: prelink ----
+          PRELINKED="frida-agent-prelinked.o.bin"
+          $AGENT_LD -r -T prelink.lds -o "$PRELINKED.tmp" \
+            --whole-archive "$AGENT_LIB_SOFTFLOAT" --no-whole-archive \
+            --start-group \
+              "$GUMJS_DEVKIT_DIR/libfrida-gumjs.a" \
+              "$LIBC" \
+              "$FRIDA_SDK/lib/libm.a" \
+              "$FRIDA_SDK/lib/libclang_rt.builtins.a" \
+            --end-group
+
+          $AGENT_OBJCOPY \
+            --keep-global-symbol=frida_agent_start \
+            --keep-global-symbol=frida_agent_stop \
+            --keep-global-symbol=gum_interceptor_obtain \
+            --keep-global-symbol=gum_interceptor_begin_transaction \
+            --keep-global-symbol=gum_interceptor_end_transaction \
+            --keep-global-symbol=gum_interceptor_replace \
+            --keep-global-symbol=gum_interceptor_revert \
+            --strip-debug \
+            --remove-section=.llvmbc --remove-section=.llvmcmd \
+            "$PRELINKED.tmp" "$PRELINKED"
+          rm -f "$PRELINKED.tmp"
+          ls -la "$PRELINKED"
+
+          # ---- step 5: kbuild ----
+          FRIDA_KMOD_DEFS=""
+          grep -q 'list_head[[:space:]]*thread_group;' "$KDIR/include/linux/sched.h" && FRIDA_KMOD_DEFS="$FRIDA_KMOD_DEFS -DFRIDA_HAVE_TASK_THREAD_GROUP"
+          grep -q 'spinlock_t[[:space:]]*lock;' "$KDIR/include/linux/fs_struct.h" && FRIDA_KMOD_DEFS="$FRIDA_KMOD_DEFS -DFRIDA_HAVE_FS_STRUCT_LOCK"
+
+          make -C "$KDIR" O="$KOUT" M="$PWD" ARCH=arm64 \
+            FRIDA_KMOD_DEFS="$FRIDA_KMOD_DEFS" MODULE_NAME=frida-agent modules
 
       - name: Report result
         run: |
