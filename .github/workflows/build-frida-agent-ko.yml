@@ -39,14 +39,14 @@ jobs:
 
       - name: Download SDKs
         run: |
-          python3 releng/deps.py sync sdk "$MACHINE_PIC"   "$RUNNER_WORKSPACE/sdk-pic"
+          # Only the nopic SDK is needed: everything ends up in a kernel
+          # module, which cannot use GOT-based relocations.
           python3 releng/deps.py sync sdk "$MACHINE_NOPIC" "$RUNNER_WORKSPACE/sdk-nopic"
-          ls "$RUNNER_WORKSPACE/sdk-pic/include" | head
+          ls "$RUNNER_WORKSPACE/sdk-nopic/include" | head
 
       - name: Pack
         run: |
           mkdir -p /tmp/out
-          tar -cJf /tmp/out/sdk-pic.tar.xz   -C "$RUNNER_WORKSPACE" sdk-pic
           tar -cJf /tmp/out/sdk-nopic.tar.xz -C "$RUNNER_WORKSPACE" sdk-nopic
           ls -la /tmp/out
 
@@ -81,7 +81,8 @@ jobs:
       - name: Unpack SDK
         run: |
           mkdir -p "$RUNNER_WORKSPACE"
-          tar -xJf /tmp/sdk/sdk-pic.tar.xz -C "$RUNNER_WORKSPACE"
+          tar -xJf /tmp/sdk/sdk-nopic.tar.xz -C "$RUNNER_WORKSPACE"
+          ls "$RUNNER_WORKSPACE/sdk-nopic"
 
       - name: Install LLVM
         run: |
@@ -103,8 +104,11 @@ jobs:
           CXX: clang++
         run: |
           export PATH=/usr/lib/llvm-21/bin:$PATH
+          # MACHINE_NOPIC, not PIC: a kernel module cannot carry GOT-based
+          # relocations (R_AARCH64_ADR_GOT_PAGE / LD64_GOT_LO12_NC); the
+          # arm64 module loader in arch/arm64/kernel/module.c supports neither.
           ./configure \
-            --host="$MACHINE_PIC" \
+            --host="$MACHINE_NOPIC" \
             --enable-gumjs \
             --with-devkits=gum,gumjs \
             --with-devkit-symbol-scope=original
@@ -371,21 +375,42 @@ jobs:
           echo "DEFS=$DEFS"
           make -C "$KDIR" O="$KOUT" M="$PWD" ARCH=arm64 LLVM=1 \
             FRIDA_KMOD_DEFS="$DEFS" MODULE_NAME=frida-agent modules
-
       - name: Inspect result
         run: |
           D="$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent/linux"
           ls -la "$D"
           KO="$D/frida-agent.ko"
-          echo "=== file ==="
-          file "$KO" || true
+          echo "=== reloc types used ==="
+          llvm-readelf -r "$KO" 2>/dev/null | grep -oE 'R_AARCH64_[A-Z0-9_]+' | sort | uniq -c | sort -rn
+          echo "=== GOT relocations present? (must be 0) ==="
+          llvm-readelf -r "$KO" 2>/dev/null | grep -cE 'R_AARCH64_(ADR_GOT_PAGE|LD64_GOT_LO12_NC|GOTREL64|GOTREL32)' || true
           echo "=== vermagic ==="
           strings "$KO" | grep -i 'vermagic=' || true
-          echo "=== init_module KCFI ID (device expects 0x6fbb3035 little-endian 3530bb6f) ==="
+          echo "=== KCFI before patch ==="
           llvm-objcopy -O binary --only-section=.init.text "$KO" /tmp/i.bin 2>/dev/null
-          od -A n -t x1 -N 4 /tmp/i.bin 2>/dev/null
-          echo "=== exit_module KCFI ID (device expects 0xe5c47d60 little-endian 607dc4e5) ==="
+          od -A n -t x1 -N 4 /tmp/i.bin
           llvm-objcopy -O binary --only-section=.exit.text "$KO" /tmp/e.bin 2>/dev/null
+          od -A n -t x1 -N 4 /tmp/e.bin
+
+      - name: Patch KCFI type hashes
+        run: |
+          # The device kernel was built with clang 19.0.1 (r536225); CI uses
+          # clang 21, whose KCFI type-hash differs. Under strict KCFI
+          # (# CONFIG_CFI_PERMISSIVE is not set) the kernel traps when
+          # do_one_initcall() compares mod->init's hash, so the module must
+          # carry the device's values: 0x6fbb3035 / 0xe5c47d60.
+          D="$GITHUB_WORKSPACE/subprojects/frida-core/src/barebone/agent/linux"
+          KO="$D/frida-agent.ko"
+          INIT_OFF=$(readelf -S -W "$KO" | awk '$2==".init.text"{print $5}')
+          EXIT_OFF=$(readelf -S -W "$KO" | awk '$2==".exit.text"{print $5}')
+          echo "init offset=$INIT_OFF exit offset=$EXIT_OFF"
+          printf '\x35\x30\xbb\x6f' | dd of="$KO" bs=1 seek=$((INIT_OFF)) conv=notrunc
+          printf '\x60\x7d\xc4\xe5' | dd of="$KO" bs=1 seek=$((EXIT_OFF)) conv=notrunc
+          echo "=== KCFI after patch ==="
+          llvm-objcopy -O binary --only-section=.init.text "$KO" /tmp/i2.bin 2>/dev/null
+          od -A n -t x1 -N 4 /tmp/i2.bin
+          llvm-objcopy -O binary --only-section=.exit.text "$KO" /tmp/e2.bin 2>/dev/null
+          od -A n -t x1 -N 4 /tmp/e2.bin
           od -A n -t x1 -N 4 /tmp/e.bin 2>/dev/null
 
       - name: Pack output
